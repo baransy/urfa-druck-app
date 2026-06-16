@@ -18,14 +18,10 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.URL
 import java.net.URLEncoder
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /**
- * Foreground-Service: pollt den Server im Sekundentakt nach offenen Bons,
- * druckt sie direkt an die Drucker-IP (ESC/POS über TCP), spielt einen lauten
- * Ton und meldet das Ergebnis zurück.
+ * Foreground-Service: pollt den Server, druckt offene Bons per ESC/POS über TCP,
+ * spielt einen Ton und sendet Bestell-Updates an die Übersicht (MainActivity).
  */
 class PollService : Service() {
 
@@ -67,7 +63,7 @@ class PollService : Service() {
                     }
                 }
             } catch (e: Exception) {
-                log("Server nicht erreichbar: ${e.message}")
+                status("⚠ Server nicht erreichbar")
             }
             try { Thread.sleep(4000) } catch (e: InterruptedException) { break }
         }
@@ -75,8 +71,15 @@ class PollService : Service() {
 
     private fun handleJob(job: JSONObject, ip: String, port: Int, server: String, token: String) {
         val id = job.getInt("id")
-        if (!seen.add(id)) return  // im selben Lauf nicht doppelt
-        log("🔔 Neue Bestellung #${job.optInt("order_id")} · ${job.optString("type")} · ${job.optString("total")} · ${job.optString("name")}")
+        if (!seen.add(id)) return
+
+        val orderId = job.optInt("order_id")
+        val type = job.optString("type")
+        val total = job.optString("total")
+        val name = job.optString("name")
+        val time = job.optString("time")
+
+        broadcastOrder(orderId, type, total, name, time, "neu")
         alarm()
 
         var ok = false
@@ -90,24 +93,41 @@ class PollService : Service() {
                 out.flush()
             }
             ok = true
-            log("   → gedruckt ✓")
         } catch (e: Exception) {
             err = e.message ?: "Druckfehler"
-            log("   → DRUCKFEHLER: $err")
         }
+
+        broadcastOrder(orderId, type, total, name, time, if (ok) "gedruckt" else "fehler")
+
         try {
             httpPost(
                 "$server/ug/druck/agent/done",
                 "id=$id&success=$ok&token=$token&error=" + URLEncoder.encode(err, "UTF-8")
             )
         } catch (e: Exception) { /* nächster Poll holt ihn ggf. erneut */ }
-        if (ok) seen.remove(id) // erledigt -> Speicher freigeben
+        if (ok) seen.remove(id)
+    }
+
+    private fun broadcastOrder(orderId: Int, type: String, total: String, name: String, time: String, status: String) {
+        sendBroadcast(
+            Intent("de.myurfa.druck.ORDER").setPackage(packageName)
+                .putExtra("orderId", orderId)
+                .putExtra("type", type)
+                .putExtra("total", total)
+                .putExtra("name", name)
+                .putExtra("time", time)
+                .putExtra("status", status)
+        )
+    }
+
+    private fun status(msg: String) {
+        sendBroadcast(Intent("de.myurfa.druck.STATUS").setPackage(packageName).putExtra("status", "Status: $msg"))
     }
 
     private fun alarm() {
         try {
             val tg = ToneGenerator(AudioManager.STREAM_ALARM, 100)
-            tg.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 2000)
+            tg.startTone(ToneGenerator.TONE_PROP_BEEP2, 800)
         } catch (e: Exception) {}
     }
 
@@ -128,13 +148,6 @@ class PollService : Service() {
         try {
             return c.inputStream.bufferedReader().use { it.readText() }
         } finally { c.disconnect() }
-    }
-
-    private fun log(msg: String) {
-        val time = SimpleDateFormat("HH:mm:ss", Locale.GERMAN).format(Date())
-        sendBroadcast(
-            Intent("de.myurfa.druck.LOG").setPackage(packageName).putExtra("msg", "$time  $msg")
-        )
     }
 
     private fun buildNotification(): Notification {
